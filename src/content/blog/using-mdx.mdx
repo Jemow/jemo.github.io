@@ -1,6 +1,6 @@
 ---
-title: '3D Graphics Programming with OpenGL ES'
-description: 'A technical devlog of my 2nd-year project: building a real-time 3D scene from scratch using OpenGL ES.'
+title: 'OpenGL ES Renderer'
+description: 'A technical devlog of my 2nd-year project: building a real-time 3D scene using OpenGL ES.'
 pubDate: 2026-02-03
 updatedDate: 2026-02-04
 heroImage: /src/assets/cars1_tuner_scene.png
@@ -18,8 +18,10 @@ j'ai eu pour mission de construire une scène 3D en temps réel 'from scratch',
 en utilisant C++ et OpenGL ES 3.0. 
 
 Ce projet a été l'occasion de voir le fonctionnement bas niveau du GPU. 
-Dans ce blogpost, je vais présenter l’architecture de mon moteur et les techniques
-de rendu, en me concentrant sur les concepts clés plutôt que sur les détails d'implémentation.
+Dans ce blogpost, je vais présenter les techniques de rendu, en me concentrant 
+sur les concepts clés plutôt que sur les détails d'implémentation.
+Pour aller plus en pronfondeur , vous pouvez lire [LearnOpenGL](https://learnopengl.com/) qui
+est l'endroit qui ma servit de références tout du long du module.
 
 # Engine
 
@@ -27,11 +29,209 @@ de rendu, en me concentrant sur les concepts clés plutôt que sur les détails 
 
 Tout commence par l'importation de la géométrie. J'ai opté pour le 
 format standard Wavefront (.obj) pour sa simplicité et sa compatibilité.
-Pour scène, j'ai choisi des modèles iconiques du film Cars (notamment Wingo). 
-Cependant, pour obtenir un rendu réaliste dans mon pipeline, j'ai générer des textures compatibles via PBR Forge.
+Pour la scène, j'ai choisi des modèles iconiques du film Cars (notamment Wingo). 
+Cependant, pour obtenir un rendu réaliste dans mon pipeline, j'ai générer des 
+textures compatibles via PBR Forge.
 
 ![Wingo](/src/assets/wingo.png)
 
+Pour l'importation des modèles 3D, j'ai utilisé la library [Assimp](https://github.com/assimp/assimp)
+qui permet de générer les vertices, indices et materials.
 
+Lors du chargement, j'utilise des flags pour transformer les données : aiProcess_Triangulate
+pour avoir des triangles et aiProcess_CalcTangentSpace pour calculer les tangentes nécessaires 
+au Normal Mapping.
+```cpp
+Assimp::Importer importer;
+
+const aiScene* scene = importer.ReadFile(
+    path,
+    aiProcess_Triangulate |
+    aiProcess_FlipUVs |
+    aiProcess_CalcTangentSpace
+);
+```
+Une fois le fichier lu, j'utilise une fonction récursive ProcessNode qui parcourt la 
+hiérarchie du modèle pour extraire chaque partie de la voiture.
+```cpp
+void Model::ProcessNode(const aiNode* node, const aiScene* scene)
+{
+    for (unsigned int i = 0; i < node->mNumMeshes; i++)
+    {
+        const aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];
+        sub_meshes_.push_back(ProcessMesh(mesh, scene));
+    }
+
+    for (unsigned int i = 0; i < node->mNumChildren; i++)
+        ProcessNode(node->mChildren[i], scene);
+}
+````
+La méthode ProcessMesh s'occupe de convertir les données d'Assimp vers mes propres
+structures de données. C'est ici que je récupère les positions, normales et 
+UVs pour créer mes sommets.
+
+## Meshes & Vertex Attributes
+
+Une fois les donnés du mesh chargées, elles doivent être envoyées au GPU. 
+Pour que le shader puisse interpréter correctement les données brutes,
+j'utilise une abstraction VertexBufferAttribute contenant toutes les informations
+nécessaires pour décrire un vertex.
+```cpp
+struct VertexBufferAttribute {
+  GLuint location;
+  GLint size;
+  GLenum type;
+  GLsizei stride;
+  size_t offset;
+};
+```
+Cela permet d'expliquer à OpenGL la structure de mon sommet : où se trouve la position, 
+la normale, les UVs, ainsi que les tangentes et bitangentes indispensables pour le Normal Mapping.
+J'utilise offsetof pour calculer automatiquement les décalages dans la mémoire.
+```cpp
+constexpr common::VertexBufferAttribute attributes[] = {
+    { 0, 3, GL_FLOAT, sizeof(Vertex), offsetof(Vertex, Position) },
+    { 1, 3, GL_FLOAT, sizeof(Vertex), offsetof(Vertex, Normal) },
+    { 2, 2, GL_FLOAT, sizeof(Vertex), offsetof(Vertex, TexCoords) },
+    { 3, 3, GL_FLOAT, sizeof(Vertex), offsetof(Vertex, Tangent) },
+    { 4, 3, GL_FLOAT, sizeof(Vertex), offsetof(Vertex, Bitangent) }
+};
+vertex_input_.BindVertexBuffer(vertex_buffer_, attributes);
+```
+
+## Materials & Textures
+
+![Textures](/src/assets/textures.png)
+Pour charger les textures associées au modèle, j'ai créé une méthode LoadMaterial. Elle utilise une
+petite lambda bien pratique pour vérifier si une texture existe dans le fichier .obj (via Assimp)
+et la charger automatiquement dans le bon slot de ma structure Material.
+
+```cpp
+Material Model::LoadMaterial(const aiMaterial* mat) const
+{
+    Material m;
+
+    auto LoadTex = [&](const aiTextureType type, common::Texture& dst)
+    {
+        if (mat->GetTextureCount(type) > 0)
+        {
+            aiString file;
+            mat->GetTexture(type, 0, &file);
+
+            const std::string full = directory_ + file.C_Str();
+            dst.Load(full);
+        }
+    };
+
+    LoadTex(aiTextureType_DIFFUSE,  m.diffuseMap);
+    LoadTex(aiTextureType_NORMALS,  m.normalMap);
+    LoadTex(aiTextureType_EMISSIVE, m.emissiveMap);
+    LoadTex(aiTextureType_SPECULAR, m.metallicMap);
+    LoadTex(aiTextureType_SHININESS, m.roughnessMap);
+    LoadTex(aiTextureType_AMBIENT, m.aoMap);
+
+    return m;
+}
+```
+Une fois les matériaux chargés, il faut les envoyer au shader. 
+Pour simplifier cela, j'utilise la méthode SetTexture dans l'abstraction Pipeline.
+
+Cette méthode fait deux choses importantes : elle informe le shader de l'unité de
+texture à utiliser (via un uniform int) et elle active cette 
+unité pour y lier la texture correspondante.
+```cpp
+void Pipeline::SetTexture(std::string_view name, const Texture& texture, int texture_unit) {
+  SetInt(name.data(), texture_unit);
+  glActiveTexture(GL_TEXTURE0 + texture_unit);
+  texture.Bind();
+}
+```
+Dans la méthode Bind du matériau, j'utilise cette abstraction pour lier toutes les maps
+(BaseColor, Normale, Metallic, etc.) de manière organisée. J'envoie aussi des booléens pour 
+que le shader sache si une texture est présente ou s'il doit utiliser une valeur par défaut.
+```cpp
+void Bind(common::Pipeline& pipeline) const {
+    pipeline.SetTexture("diffuseMap",   diffuseMap,   0);
+    pipeline.SetTexture("normalMap",    normalMap,    1);
+    pipeline.SetTexture("emissiveMap",  emissiveMap,  2);
+    pipeline.SetTexture("metallicMap",  metallicMap,  3);
+    pipeline.SetTexture("roughnessMap", roughnessMap, 4);
+    pipeline.SetTexture("aoMap",        aoMap,        5);
+
+
+    pipeline.SetBool("useNormalMap", normalMap.get().texture_name != 0);
+    pipeline.SetBool("useMetallicMap", metallicMap.get().texture_name != 0);
+    // ...
+}
+```
+Puis la classe common::Texture s'occupe de la partie technique avec stb_image.
+
+## Back Face Culling
+
+Pour optimiser le rendu, j'ai appris 2 techniques de culling.
+La première est le Back-face Culling. C'est une technique très rapide à
+implémenter qui demande au GPU de ne pas dessiner les faces arrière des objets 
+Cela réduit le nombre de triangles à traiter sans affecter le visuel final.
+```cpp
+glEnable(GL_CULL_FACE);
+glCullFace(GL_BACK);
+glFrontFace(GL_CCW); // Définit le sens de lecture des triangles (Counter-Clockwise)
+```
+Dans cette image, notre caméra se trouve à l'intérieur de la voiture (Wingo).
+Avec le Back-Face Culling activé, toutes les faces de la carrosserie qui pointent
+vers l'extérieur ne sont pas rendues. C'est pour cette raison que l'on peut voir 
+à travers le modèle depuis l'intérieur.
+![Back Face Culling example](/src/assets/back_face_culling.png)
+Pour tester visuellement le concept, on peut également inverser le mode en Front-Face Culling :
+dans ce cas,le GPU n'affichera que l'intérieur (les faces arrière) et masquera l'extérieur 
+de la voiture.
+
+## Frustum Culling
+
+La deuxième technique est le Frustum Culling. Contrairement au Back-face qui 
+travaille au niveau des triangles, le Frustum Culling intervient au niveau des modèles. 
+L'objectif est de ne pas envoyer au GPU les objets qui se trouvent en dehors du champ
+de vision de la caméra.
+
+Le champ de vision est représenté par une pyramide tronquée (le Frustum) définie par six plans : 
+le Near plane (proche), le Far plane (lointain), ainsi que les plans haut, bas, gauche et droite.
+![Frsutum Camera example](/src/assets/frustum_example.png)
+Pour savoir si un objet doit être rendu, je vérifie s'il intersecte cette zone de vision. 
+Chaque modèle possède un membre AABB (Axis-Aligned Bounding Box) qui
+est pré-calculé lors du Model::Load.
+
+Pour mettre cela en pratique, j'ai créé une classe Frustum très simple. 
+Elle contient les six plans de la pyramide de vue et possède une méthode IsOnFrustum. 
+Cette fonction prend l'AABB d'un modèle et sa modelMatrix pour déterminer
+instantanément si l'objet est visible ou non.
+```cpp
+class Frustum
+{
+public:
+    void Update(const glm::mat4& viewProjection);
+    bool IsOnFrustum(const AABB& box, const glm::mat4& modelMatrix) const;
+
+private:
+    std::array<Plane, 6> planes_;
+};
+```
+J'ai intégré cette logique directement dans l'abstraction de ma Camera.
+En combinant la matrice de projection et la matrice de vue, la caméra peut 
+générer un Frustum à jour à chaque frame.
+```cpp
+Frustum Camera::get_frustum() const
+{
+    Frustum frustum;
+    frustum.Update(projection_matrix_ * get_view_matrix());
+    return frustum;
+}
+```
+
+## GPU Instancing
+
+La dernière technique d'optimisation que j'ai implémentée est l'Instancing.
+C'est indispensable pour afficher des objets répétés de nombreuses fois,
+comme les cônes de chantier dans ma scène.
+![Instancing Cone example](/src/assets/instancing_example.png)
 
 # Conclusion
