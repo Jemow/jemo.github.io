@@ -655,7 +655,7 @@ Et voilà le résultat : le bruit a disparu pour laisser place à une occlusion 
 Une fois les données du G-Buffer et du SSAO prêtes, on peut enfin calculer l'éclairage. L'une des étape
 à la fois cool niveau rendu et un peu plus complex a comprendre hehe...
 
-Au départ, j'ai implémenté le modèle Blinn-Phong. C'est l'approche "classique" et peu coûteuse : 
+Au départ, j'ai implémenté les 3 types de lumière (Directionnel, Point, Spot) avec le modèle Blinn-Phong. C'est l'approche "classique" : 
 on additionne une composante Diffuse (la couleur de l'objet) et une composante Spéculaire
 (le reflet brillant). 
 ![Halfway example](/assets/halfway.png)
@@ -746,5 +746,62 @@ Lo += (kD * albedo / PI + specular) * radiance * NdotL;
 Ok, avec ça, on a la base du PBR. Mais il manque un truc essentiel pour que ça claque vraiment.
 Pour l'instant, notre Diffuse se résume juste à c/π, et le métal ne reflète rien du tout.
 
+C'est là qu'intervient l'IBL (Image Based Lighting). L'idée est d'utiliser la Skybox HDR comme une 
+source de lumière géante. Au lieu d'avoir juste une lampe ponctuelle à une position précise, 
+on considère que chaque pixel du ciel émet de la lumière.
+![IBL example](/assets/ibl_example.png)
+Pour résoudre l'intégrale de lumière avec cette infinité de sources lumineuses,
+on commence par simplifier l'équation. On sépare le calcul en deux parties distinctes :
+la Diffuse et la Spéculaire.
+![IBL 2 Part formula](/assets/ibl_two_parts.png)
+La partie jaune représente l'intégrale de la Diffuse, et la partie rose celle du Spéculaire. 
+En les séparant, cela nous permet de résoudre d'abord la partie Diffuse (Irradiance) indépendamment.
+Vous pouvez voir les détails mathématiques ici [LearnOpenGL/PBR/IBL/Diffuse-irradiance](https://learnopengl.com/PBR/IBL/Diffuse-irradiance)
 
+Pour faire fonctionner cette équation, il nous faut 3 textures spécifiques :
+- Irradiance Map : Une version très floue de la skybox pour la lumière diffuse.
+- Prefilter Map : La skybox stockée avec différents niveaux de flou dans les mipmaps
+- BRDF LUT (Look Up Table) : C'est la fameuse texture "rouge et verte". Elle contient les valeurs pré-calculées de l'échelle (Scale) et du décalage (Bias) du BRDF.
+<div style={{ display: 'flex', justifyContent: 'center', margin: '20px 0' }}>
+  <img 
+    src="/assets/ibl_brdf_lut.png" 
+    alt="IBL BRDF LUT" 
+    style={{ maxWidth: '300px', width: '100%', height: 'auto' }} 
+  />
+</div>
+
+Calculer tout ça en temps réel serait beaucoup trop lourd. 
+J'ai donc généré ces textures Offline (à l'avance) en utilisant cmft Studio. 
+Je lui donne ma Skybox HDR, et il me sort l'Irradiance et le Prefilter .hdr.
+<div style={{ display: 'flex', gap: '10px', justifyContent: 'center', alignItems: 'center' }}>
+  <img src="/assets/ibl_skybox.png" alt="IBL Skybox" style={{ maxWidth: '33%', height: 'auto' }} />
+  <img src="/assets/ibl_prefilter.png" alt="IBL Prefilter" style={{ maxWidth: '33%', height: 'auto' }} />
+  <img src="/assets/ibl_irradiance.png" alt="IBL Irradiance" style={{ maxWidth: '33%', height: 'auto' }} />
+</div>
+Pour la Diffuse, c'est direct, on tape dans l'Irradiance Map. 
+Pour la Spéculaire, c'est là qu'on applique le Split Sum. On récupère la lumière via textureLod
+et on mixe le tout avec les valeurs de la LUT.
+
+Une fois qu'on a cet éclairage ambiant complet, il suffit de l'ajouter au résultat
+des lumières directes (Lo) et de l'émissive.
+```cpp
+// --- IBL DIFFUSE ---
+vec2 uvIrradiance = SampleSphericalMap(N);
+vec3 irradiance = texture(irradianceMap, uvIrradiance).rgb * skyboxIntensity;
+vec3 diffuse = irradiance * albedo;
+
+// --- IBL SPECULAR ---
+const float MAX_REFLECTION_LOD = 8.0;
+vec2 uvPrefilter = SampleSphericalMap(R);
+vec3 prefilteredColor = textureLod(prefilterMap, uvPrefilter, roughness * MAX_REFLECTION_LOD).rgb;
+
+vec2 brdf  = texture(brdfLUT, vec2(max(dot(N, V), 0.0), roughness)).rg;
+
+vec3 specular = prefilteredColor * (F0 * brdf.x + brdf.y);
+specular *= (1.0 - roughness);
+
+vec3 ambient = (kD * diffuse + specular) * ao;
+```
+Et voilà le résultat final sur la voiure (Boost)
+![IBL Result](/assets/ibl_result.png)
 # Conclusion
