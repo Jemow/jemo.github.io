@@ -804,4 +804,30 @@ vec3 ambient = (kD * diffuse + specular) * ao;
 ```
 Et voilà le résultat final sur la voiure (Boost)
 ![IBL Result](/assets/ibl_result.png)
+
+## Framebuffer
+
+Pour rendre possible le Deferred Rendering, le Post-Processing ou même la génération de l'IBL,
+je ne peux pas dessiner directement à l'écran (le Backbuffer). J'ai besoin de dessiner "hors-écran".
+Pour éviter de réécrire la configuration OpenGL à chaque fois, j'utilise une abstraction common::Framebuffer. 
+Elle gère automatiquement :
+- La création des textures.
+- L'attachement au Framebuffer Object (FBO).
+- La gestion du Depth/Stencil
+
+Tout le setup se fait dans common::Framebuffer::Load, où la
+création des textures et surtout l'activation du MRT (Multiple Render Targets) est gérer.
+C'est ce qui permet d'écrire dans gPosition, gNormal et gAlbedo en même temps.
+Ça tient en deux appels :
+```cpp
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, target, texture_id, 0);
+glDrawBuffers(attachment_count, attachments_list.data());
+```
+Dernière étape du pipeline : le rendu sur un Screen Quad. Une fois toute la géométrie calculée, 
+au lieu d'afficher l'image directement, je la projette sur un simple quad 
+qui recouvre tout l'écran. J'ai pu y ajouté plusieurs filtre différent (Grayscale, Inverse, Sharpen)
+<div style={{ display: 'flex', flexWrap: 'wrap', gap: '15px', justifyContent: 'center' }}> <div style={{ width: '45%', textAlign: 'center' }}> <img src="/assets/fb_normal.png" alt="Normal" style={{ width: '100%', height: 'auto' }} /> <p><strong>Normal</strong></p> </div> <div style={{ width: '45%', textAlign: 'center' }}> <img src="/assets/fb_grayscale.png" alt="Grayscale" style={{ width: '100%', height: 'auto' }} /> <p><strong>Grayscale</strong></p> </div> <div style={{ width: '45%', textAlign: 'center' }}> <img src="/assets/fb_inverse.png" alt="Inverse" style={{ width: '100%', height: 'auto' }} /> <p><strong>Inverse</strong></p> </div> <div style={{ width: '45%', textAlign: 'center' }}> <img src="/assets/fb_sharpen.png" alt="Sharpen" style={{ width: '100%', height: 'auto' }} /> <p><strong>Sharpen</strong></p> </div> </div>
+
+## HDR + Bloom
+
 # Conclusion
