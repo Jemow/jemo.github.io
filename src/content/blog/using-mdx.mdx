@@ -830,4 +830,137 @@ qui recouvre tout l'écran. J'ai pu y ajouté plusieurs filtre différent (Grays
 
 ## HDR + Bloom
 
+Par défaut, un écran standard (LDR) et OpenGL clampent les couleurs entre 0.0 et 1.0.
+Le problème, c'est qu'avec le PBR, le soleil ou des reflets métalliques peuvent
+avoir des intensités de 10.0, 50.0 ou plus. Si on coupe tout à 1.0, 
+on perd toute la nuance des hautes lumières.
+
+En utilisant un Framebuffer avec un format de couleur flottant (GL_RGBA16F). 
+Cela permet à la carte graphique de stocker des valeurs bien supérieures à 1.0 sans les perdre.
+Dans mon abstraction HDRBuffer, j'initialise ce buffer spécial et j'active le MRT 
+(Multiple Render Targets) pour extraire la brillance en même temps :
+```cpp
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+constexpr unsigned int attachments[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+glDrawBuffers(2, attachments);
+```
+Vu que nos écrans ne peuvent pas afficher physiquement une valeur de 10.0, 
+on doit convertir l'image HDR vers du LDR (0.0 - 1.0) à la toute fin du pipeline. 
+C'est le Tone Mapping. J'utilise l'Exposure Tone Mapping.
+Ensuite, il ne faut pas oublier la Gamma Correction. Les calculs physiques se font
+en espace linéaire, mais on attends (oeil humain et écrans) une courbe Gamma (puissance 2.2).
+```cpp
+// post_process.frag
+void main()
+{
+    const float gamma = 2.2;
+    vec3 hdrColor = texture(scene, TexCoords).rgb;
+
+    vec3 result = vec3(1.0) - exp(-hdrColor * exposure);
+
+    result = pow(result, vec3(1.0 / gamma));
+
+    FragColor = vec4(result, 1.0);
+}
+```
+Le Bloom, c'est l'effet de halo lumineux autour des objets très brillants. 
+Ça donne l'illusion que la lumière est tellement forte qu'elle "bave" sur la caméra.
+![Bloom example](/assets/bloom_example.jpg)
+Afin d'avoir du bloom je le fais en 3 étapes :
+
+1. Dans le shader PBR principal, pendant qu'on dessine la scène, 
+on sépare les pixels qui dépassent une certaine luminosité (Threshold). 
+```cpp
+// deferred_lit.frag
+FragColor = vec4(result, 1.0);
+
+float brightness = dot(result, vec3(0.2126, 0.7152, 0.0722));
+BrightColor = brightness > 1.0 ? vec4(result, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+```
+2. Ajouter le [Gaussian Blur](https://en.wikipedia.org/wiki/Gaussian_blur), je prend la texture "BrightColor" et on la floute énormément. 
+Pour optimiser, au lieu de faire un gros flou en une fois, j'utilise un Ping-Pong Rendering : 
+je floute horizontalement, puis verticalement, plusieurs fois de suite. 
+C'est géré par ma classe Bloom qui alterne entre deux Framebuffers :
+```cpp
+// graphics::Bloom::RenderBloom
+bool horizontal = true;
+for (int i = 0; i < amount; i++)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, pingpongFBO_[horizontal]);
+    blur_pipeline_.SetBool("horizontal", horizontal);
+
+    quadMesh.Draw();
+
+    horizontal = !horizontal;
+}
+```
+3. Combinaison Enfin, dans le shader de post-process final, on additionne simplement 
+l'image HDR originale avec l'image floutée (Bloom). C'est là que tout se réunit.
+```cpp
+// post_process.frag
+vec3 hdrColor = texture(scene, TexCoords).rgb;
+vec3 bloomColor = texture(bloomBlur, TexCoords).rgb;
+
+hdrColor += bloomColor; 
+```
+Maintenant comparons le résultat sans et avec le bloom!
+<div style={{ display: 'flex', gap: '20px', justifyContent: 'center', alignItems: 'flex-start' }}> <div style={{ width: '48%', textAlign: 'center' }}> <img src="/assets/bloom_disable.png" alt="Bloom Disabled" style={{ width: '100%', height: 'auto' }} /> <p><strong>Bloom OFF</strong></p> </div> <div style={{ width: '48%', textAlign: 'center' }}> <img src="/assets/bloom_enable.png" alt="Bloom Enabled" style={{ width: '100%', height: 'auto' }} /> <p><strong>Bloom ON</strong></p> </div> </div>
+
+## Emission
+
+Petit bonus, j'ai ajouté de l'Emission sur mes modèles. 
+C'est ce qui permet à certaines parties de l'objet de "briller" dans le noir
+comme des néons pour bien respecter la scene dans cars.
+
+L'intégration était franchement simple. Côté chargement (Assimp), 
+il suffisait de récupérer la texture correspondante :
+```cpp
+LoadTex(aiTextureType_EMISSIVE, m.emissiveMap);
+```
+Ensuite, je la stocke dans mon G-Buffer. 
+Je multiplie la couleur par une emissiveStrength pour pouvoir contrôler l'intensité du "glow" :
+```cpp
+// gbuffer.frag
+gEmissive = useEmissiveMap ? texture(emissiveMap, TexCoords).rgb * emissiveStrength : vec3(0.0);
+```
+Et enfin, dans la passe d'éclairage différé (deferred_lit.frag), 
+c'est de la lumière pure. Donc je l'ajoute simplement au résultat final, sans calcul d'ombrage. 
+C'est là que le Bloom fait tout le travail : comme l'intensité est élevée, 
+le calcul de brightness va capturer ces pixels et créer le halo lumineux.
+```cpp
+// deferred_lit.frag
+vec3 emissive = texture(gEmissive, TexCoords).rgb;
+
+// Ajout de l'emission
+vec3 result = ambient + Lo + emissive;
+
+FragColor = vec4(result, 1.0);
+
+float brightness = dot(result, vec3(0.2126, 0.7152, 0.0722));
+BrightColor = brightness > 1.0 ? vec4(result, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+```
+Voici une emissive map que j'ai fais moi meme pour la voiture DJ (La bleu) qui ma
+pris 2H30 à faire (vraiment)
+![DJ Emissive](/assets/dj_emissive.png)
+Puis le résultat finale dont je suis fière!
+![DJ Emissive Result](/assets/dj_emissive_result.png)
+
 # Conclusion
+
+Voilà ! On a à peu près fait le tour des techniques utilisées dans ma scène 3D finale. Durant ce module,
+j'ai eu pas mal de moments d'incompréhension car je n'ai pas l'habitude d'être aussi bas niveau avec le GPU, 
+mais petit à petit, on s'y fait. J'ai aussi pu voir comment utiliser le GPU pour des calculs autres que le rendu pur (via CUDA).
+
+C'était à la fois frustrant et gratifiant de voir un résultat qui marche. 
+Personnellement, j'ai trouvé très intéressant de toucher un peu à OpenGL. 
+J'ai appris beaucoup de choses qui m'ont permis de mieux comprendre le fonctionnement des moteurs graphiques,
+même si aujourd'hui les gros moteurs utilisent plutôt DX11, DX12 ou Vulkan.
+
+L'expérience était cool ! Avoir essayé de faire une petite scène sur le thème de Cars est ce qui m'a le plus motivé sur ce module.
+S'il manque quelque chose à ma scène, ce serait les ombres pour les Point Lights et pourquoi pas le Cascaded Shadow Mapping.
+Mais sinon, je reste très fier de cette scène 3D ! Maintenant, quand je jouerai à n'importe quel AAA,
+je remarquerai toujours les techniques que j'ai apprises ici.
+
+N'hésitez pas à checker mon [Github](https://github.com/SAE-Geneve/compgraphsample-Jemow) pour voir l'implémentation plus en détail,
+
+Sur ce, merci pour votre lecture !
