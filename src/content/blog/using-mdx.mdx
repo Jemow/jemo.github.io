@@ -169,7 +169,7 @@ The catch is that the normals in a "Normal Map" are defined in Tangent Space (lo
 To use them in World Space for lighting calculations, we need a transition matrix: the TBN Matrix.
 
 I handle this calculation in the Vertex Shader using the `aNormal` and `aTangent` attributes provided by Assimp.
-```cpp
+```glsl
   mat3 normalMatrix = mat3(transpose(inverse(finalModel)));
   vec3 T = normalize(normalMatrix * aTangent);
   vec3 N = normalize(normalMatrix * aNormal);
@@ -272,7 +272,7 @@ void Mesh::SetupInstancing(const common::VertexBuffer& instance_buffer) {
 On the Shader side, the logic is pretty straightforward. If instancing is enabled,
 I use the instance matrix received as an attribute (`aInstanceMatrix`) instead of the standard model matrix.
 This allows me to position each cone at its own unique location while still using the exact same geometry.
-```cpp
+```glsl
 layout (location = 5) in mat4 aInstanceMatrix;
 uniform bool useInstancing;
 
@@ -449,7 +449,7 @@ light_space_matrix_ = lightProjection * lightView;
 ```
 The shader is minimal. It transforms vertices directly into light space. No need for a complex fragment shader;
 OpenGL handles depth writing automatically.
-```cpp
+```glsl
 void main() {
     mat4 finalModel = useInstancing ? aInstanceMatrix : model;
     gl_Position = lightSpaceMatrix * finalModel * vec4(aPos, 1.0);
@@ -462,7 +462,7 @@ Here is what the depth texture looks like when captured from the light source:
 Once the depth texture is generated, I handle the shadow calculation in my main fragment shader, 
 `deferred_lit.frag`. To avoid Shadow Acne (black stripes caused by calculation imprecision), 
 I apply a standard Bias and a Normal Bias that depends on the face's angle relative to the light.
-```cpp
+```glsl
 float ShadowCalculation(vec4 fragPosLightSpace, vec3 normal, vec3 fragPos) {
     vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
     projCoords = projCoords * 0.5 + 0.5;
@@ -505,7 +505,7 @@ To address this, I use a Poisson Disk . Instead of testing pixels on a straight 
 I use 16 points placed in a more "random" but well-distributed way.
 I relied on this [LearnOpenGL](https://www.opengl-tutorial.org/intermediate-tutorials/tutorial-16-shadow-mapping/#poisson-sampling) 
 tutorial for the implementation.
-```cpp
+```glsl
 vec2 poissonDisk[16] = vec2[](
     vec2( -0.94201624, -0.39906216 ),
     vec2( 0.94558609, -0.76890725 ),
@@ -529,7 +529,7 @@ By multiplying a random value by 2π (6.28318530718), I generate a random rotati
 This angle serves to rotate the 16 points of the disk differently for each pixel.
 This helps "mix" the samples. The `rand` function comes from this 
 [Khronos discussion](https://community.khronos.org/t/random-values/75728 ).
-```cpp
+```glsl
 float shadow = 0.0;
   vec2 texelSize = 1.0 / vec2(textureSize(shadowMap, 0));
 
@@ -637,7 +637,7 @@ void SceneSample::RenderSSAOPass(const glm::mat4& view, const glm::mat4& project
 ```
 The blur shader is super simple. Unlike a Gaussian blur (which we'll see later), here a simple average does the trick (Box Blur). 
 I iterate over a 4x4 texel grid around the current position, sum up the occlusion values, and divide the whole thing by 16.
-```cpp
+```glsl
 vec2 texelSize = 1.0 / vec2(textureSize(ssaoInput, 0));
 float result = 0.0;
 
@@ -688,7 +688,7 @@ To control this, we ditch the old "Specular Maps" in favor of 3 physical texture
 Ambient Occlusion, Roughness, and Metallic into a single texture called "ARM" (Red, Green, Blue) to save memory. 
 
 On my end, I simply stored them in the Alpha channels (`.a`) of the G-Buffer:
-```cpp
+```glsl
 gNormal.rgb = normalize(Normal);
 gNormal.a = useRoughnessMap ? texture(roughnessMap, TexCoords).r : 0.5;
 gAlbedo.rgb = texture(diffuseMap, TexCoords).rgb;
@@ -728,7 +728,7 @@ of energy by adjusting the diffuse (`kD`) based on the specular (`kS`).
 
 Here is the snippet from the Fragment Shader that handles a light:
 
-```cpp
+```glsl
 vec3 L = normalize(lights[i].position - fragPos);
 vec3 V = normalize(viewPos - fragPos);
 vec3 H = normalize(V + L); // Half-way vector
@@ -796,7 +796,7 @@ For the Specular, that's where we apply the Split Sum. We retrieve the light via
 and mix it all with the values from the LUT. 
 
 Once we have this full ambient lighting, we just add it to the direct lighting result (`Lo`) and the emissive.
-```cpp
+```glsl
 // --- IBL DIFFUSE ---
 vec2 uvIrradiance = SampleSphericalMap(N);
 vec3 irradiance = texture(irradianceMap, uvIrradiance).rgb * skyboxIntensity;
@@ -862,7 +862,7 @@ This is **Tone Mapping**. I use Exposure Tone Mapping.
 
 Next, we must not forget **Gamma Correction**. Physical calculations are done in linear space, 
 but we (human eye and screens) expect a Gamma curve (power 2.2).
-```cpp
+```glsl
 // post_process.frag
 void main()
 {
@@ -884,7 +884,7 @@ It gives the illusion that the light is so strong it "bleeds" into the camera.
 To achieve bloom, I do it in 3 steps:
 
 1. In the main PBR shader, while rendering the scene, we separate pixels that exceed a certain brightness (Threshold).
-```cpp
+```glsl
 // deferred_lit.frag
 FragColor = vec4(result, 1.0);
 
@@ -910,7 +910,7 @@ for (int i = 0; i < amount; i++)
 ```
 3. Combination Finally, in the final post-process shader, we simply add the original HDR image
 with the blurred image (Bloom). This is where it all comes together.
-```cpp
+```glsl
 // post_process.frag
 vec3 hdrColor = texture(scene, TexCoords).rgb;
 vec3 bloomColor = texture(bloomBlur, TexCoords).rgb;
@@ -932,7 +932,7 @@ LoadTex(aiTextureType_EMISSIVE, m.emissiveMap);
 ```
 Next, I store it in my G-Buffer. 
 I multiply the color by an `emissiveStrength` to be able to control the intensity of the "glow":
-```cpp
+```glsl
 // gbuffer.frag
 gEmissive = useEmissiveMap ? texture(emissiveMap, TexCoords).rgb * emissiveStrength : vec3(0.0);
 ```
@@ -940,7 +940,7 @@ And finally, in the deferred lighting pass (`deferred_lit.frag`), it acts as pur
 So I simply add it to the final result, without any shadow calculation.
 This is where Bloom does all the work: since the intensity is high, the brightness
 calculation will capture these pixels and create the glowing halo.
-```cpp
+```glsl
 // deferred_lit.frag
 vec3 emissive = texture(gEmissive, TexCoords).rgb;
 
